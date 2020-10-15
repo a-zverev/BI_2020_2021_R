@@ -38,9 +38,8 @@ batch_read_data <- function(path){
   sapply(files, read_data, simplify = F) %>% bind_rows()
 }
 
-
-batch_read_data("/home/alexey/BI/R/Project_1/Data/")
+# read as a data frame. Use full path, like one below:
+# batch_read_data("/home/alexey/BI/R/Project_1/Data/")
 ```
-## Test data
 
 
