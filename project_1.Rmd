@@ -1,0 +1,46 @@
+---
+title: "Mussels Drama"
+output: html_document
+---
+
+
+## Libraries
+
+```{r message=FALSE}
+if (!require(tidyverse)) install.packages('tidyverse')
+library(tidyverse)
+
+
+```
+
+## Read Data
+
+```{r}
+
+read_data <- function(file){
+  library(tidyverse)
+  
+  correct_order <- c("Source", "Rings", "Sex", "Length", "Diameter", "Height", "Whole_weight", "Shucked_weight", "Viscera_weight", "Shell_weight")
+    
+    data <- read.csv(file)
+    data %>% 
+    rename(Sex = Sex..1...male..2...female..3...uvenil.) %>% 
+    mutate(Sex = recode_factor(Sex, `1` = "Male", `2` = "Female", `3` = "Juvenile")) %>% 
+    mutate(across(!Sex, as.numeric)) %>% 
+    mutate(Source = gsub(pattern = "\\.csv$", "", basename(file))) %>% 
+    relocate(correct_order)
+}
+
+batch_read_data <- function(path){
+  library(tidyverse)
+  
+  files <- list.files(path = path, pattern = "*.csv", full.names = T)
+  sapply(files, read_data, simplify = F) %>% bind_rows()
+}
+
+
+batch_read_data("/home/alexey/BI/R/Project_1/Data/")
+```
+## Test data
+
+
