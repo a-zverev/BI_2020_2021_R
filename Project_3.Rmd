@@ -1,0 +1,347 @@
+---
+title: "Project_3: Trisomic mice"
+author: "Aleksei Zverev"
+date: "13/2/2021"
+output: 
+  html_document: 
+    keep_md: yes
+    number_section: yes
+    toc: yes
+    toc_float: yes
+---
+
+# Libraries, load data
+
+Load requred libraries, load data and move factor columns ahead. 
+
+```{r warning = FALSE, message = FALSE}
+library(readxl)
+library(tidyverse)
+library(car)
+library(Hmisc)
+library(multcomp)
+library(gridExtra)
+library(vegan)
+library(ggpubr)
+library(plotly)
+library(DESeq2)
+
+
+
+setwd('/home/alexey/BI/R/Project_3/')
+download.file(url='https://archive.ics.uci.edu/ml/machine-learning-databases/00342/Data_Cortex_Nuclear.xls',
+              destfile='Data_Cortex_Nuclear.xls')
+data <- read_xls('Data_Cortex_Nuclear.xls')
+
+# Factors first
+data <- data %>% 
+  relocate(where(is.numeric), .after = where(is.character)) %>% 
+  mutate(across(where(is.character), as.factor))
+
+data[1:10,1:10]
+```
+
+---
+
+
+# Describe dataset
+
+So, what is our data?
+
+* Proteins! Lots of proteins! More precisely, we have `r ncol(data %>% keep(is.numeric))` different proteins' levels.
+* **MouseID** is a uniq ID for every mouse: length is `r length(data$MouseID)` in `r length(levels(data$MouseID))` levels. Not really useful for us.
+* **Genotype** is a genotype of the mouse. It has `r length(levels(data$Genotype))` levels, "Control" for normal mice (`r length(data[data$Genotype == "Control",])` mice), and "Ts65Dn" as model line for Down syndrome mice (`r length(data[data$Genotype == "Ts65Dn",])` mice)
+* **Treatment** is a description of treatment for mice. Also it has `r length(levels(data$Treatment))` levels, "Memantine" (`r length(data[data$Treatment == "Memantine",])` mice) and "Saline" (`r length(data[data$Treatment == "Saline",])` mice) treatment
+* **Behavior** some mice have been stimulated to learn (context-shock, or "C/S" - `r length(data[data$Behavior == "C/S",])` mice) and others have not (shock-context, "S/C" - `r length(data[data$Behavior == "S/C",])` mice)
+* **class** is the most interesting column, described three previous groups in one. It combines from three factors: control (c) or trisomy (t); context-shock (CS) or shock-context (SC); memantine (m) or saline (s) treatment. Afterwards we will use it for analysis, so, look at it closely:
+
+```{r}
+res <- merge(data %>% group_by(class) %>% summarise(Total_entries = n(), .groups = "keep"),
+             na.omit(data) %>% group_by(class) %>% summarise(Entries_without_NA = n(), .groups = "keep"),
+             by = "class")
+res$class <- as.character(res$class)
+
+res %>%  rbind(c('All classes', nrow(data), nrow(na.omit(data))))
+```
+
+So, roughly half of our data contain one or more NAs in protein levels; every class have from 135 to 150 mice, including 45 to 90 mice without any NA in 77 proteins.
+
+---
+
+
+# Is there any differences in BDNF_N in different classes
+
+For this question, we should use one-way variance analysis. Filter data from NA and see at our abundances.
+
+```{r}
+aov_data <- data %>% dplyr::select(class, BDNF_N) %>% na.omit
+aov_data %>% group_by(class) %>% summarise(n = n(), .groups = "keep")
+```
+
+105 and 150 looks non-equal, but we don't have strict criteria for number of elements, ant it is not more than 1.5 times, so, go ahead with this data.
+
+## AOV
+
+```{r}
+aov_fit <- aov(BDNF_N ~ class, data = aov_data)
+summary(aov_fit)
+```
+
+Also check, can we use variance analysis at all. Check normality of residues and Cook's distance
+
+```{r}
+fortified_data <- fortify(aov_fit)
+
+ggplot(fortified_data, aes(x = 1:nrow(fortified_data), y = .cooksd)) + geom_bar(stat = "identity") + ggtitle("Cook's distance plot")
+ggplot(fortified_data, aes(x = class, y = .stdresid)) + geom_boxplot() + ggtitle("Residuals plot")
+qqPlot(aov_fit, id = FALSE, main = "Residuals plot")
+```
+
+Ok, Cook's distance is lower, than 0.015 (we havn't outliers), and residuals distributed normally. We can use aov.
+
+## Post-hoc tests
+
+Ok, there is significant difference in BDNF_N level in different classes. In which pairs exactly they are? Perform post-hoc tests:
+
+```{r}
+post_hoch <- glht(aov_fit, linfct = mcp(class = "Tukey"))
+summary(post_hoch)
+```
+
+## Plot
+
+And sure, draw the plot
+
+```{r}
+ggplot(aov_data, aes(x = class, y = BDNF_N)) + geom_boxplot() + theme(axis.title.x=element_blank())
+```
+
+---
+
+
+# Make linear model for ERBB4_N according other proteins
+
+Make full model for all proteins in dataset. Remove all NA-values, and make standartisation.
+
+```{r}
+proteins <- data %>% keep(is.numeric)
+proteins_scale <- as.data.frame(sapply(proteins, scale)) %>% na.omit()
+formula <- as.formula(ERBB4_N ~ .)
+fit <- lm(formula, data = proteins_scale)
+summary(fit)
+```
+
+NAs for pS6_N protein is strange - perhaps, this one aliased by another predictor?
+
+```{r}
+attributes(alias(fit)$Complete)$dimnames[[1]]
+
+apply(proteins_scale, 2, function(col)cor(col, proteins_scale$pS6_N))
+```
+
+Yep. ARC_N and pS6_N are fully correlated, so, they are aliases. We haven't any information about significance of every protein, so, drop last one - pS6_N - and revaluate the model.
+
+````{r}
+fit <- update(fit, . ~ . -pS6_N)
+summary(fit)
+```
+
+Next step - remove multicollinearity
+
+```{r}
+vif(fit)
+```
+
+Lots and lots of collinear predictors. Bad for us. Try to make auto drop for every predictor until vif() will be less than 2.
+
+```{r}
+refit <- function(df){
+  ## God, I hate update() function: it works wrong, when you try to pass a name of 
+  ## predictor to remove, and do not return an error, where it must. 
+  predictors <- colnames(df)
+  # remove alias and our protein
+  predictors <- predictors[predictors != "ERBB4_N"]
+  predictors <- predictors[predictors != "pS6_N"]
+  # create lm
+  fit <- lm(as.formula(paste("ERBB4_N ~ ", paste0(predictors, collapse="+"))), data = df)
+  vif <- vif(fit)
+  # predictor with highest VIF
+  predictor <- vif[vif == max(vif)]
+  while(predictor >= 2){
+    print(paste(names(predictor), "- removed with VIF ", unname(predictor)))
+    predictors <- predictors[predictors != names(predictor)]
+    formula <- paste("ERBB4_N ~ ", paste(predictors, collapse="+"),sep = "")
+    fit <- lm(formula, data = df)
+    vif <- vif(fit)
+    predictor <- vif[vif == max(vif(fit))]
+  }
+  predictors
+}
+
+good_predictors <- refit(proteins_scale)
+print(good_predictors)
+```
+
+Recalculate reduced LM with good predictors only
+
+```{r}
+formula <- paste("ERBB4_N ~ ", paste(good_predictors, collapse="+"),sep = "")
+fit_red <- lm(formula, data = proteins_scale)
+
+summary(fit_red)
+vif(fit_red)
+```
+
+Remove non-significant and predictors until all of them are significant at 0.05 or less (one by one, but in code next it done in bulk for shortage)
+
+```{r}
+fit_red <- fit_red %>% update(.~.-pELK_N -RRP1_N)
+fit_red <- fit_red %>% update(.~.-DSCR1_N -pCAMKII_N -pP70S6_N)
+summary(fit_red)
+```
+
+Our model is not good (explain just 0.66 of all variance), but let's test it - perhapse, it isn't useful at all.
+
+## Test model
+
+```{r}
+fortified_fit_red <- data.frame(fortify(fit_red), proteins_scale)
+
+gg_resid <- ggplot(data = fortified_fit_red, aes(x = .fitted, y = .stdresid)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0) +
+  geom_smooth(method = "lm") +
+  geom_hline(yintercept = 2, color = "red") +
+  geom_hline(yintercept = -2, color = "red")
+gg_resid
+```
+
+Residuals demonstrate heavy outliers. Model should be corrected (perhaps, add back some of discarded predictors)
+
+```{r}
+ggplot(fortified_fit_red, aes(x = 1:nrow(fortified_fit_red), y = .cooksd)) + 
+  geom_bar(stat = "identity") + 
+  geom_hline(yintercept = 2, color = "red")
+```
+
+Ok, no overweighted values
+
+```{r}
+qqPlot(fortified_fit_red$.stdresid)
+```
+
+Not very good, but looks like
+
+```{r message=FALSE, warning=FALSE}
+predictors <- colnames(proteins_scale %>% dplyr::select(-pS6_N, -ERBB4_N))
+dropped_predictors <- predictors[!(predictors %in% good_predictors)]
+draw_it <- function(i){
+  gg_resid + aes(x = fortified_fit_red[,i]) + xlab(i) + theme(axis.title.y=element_blank())
+}
+plots <- lapply(dropped_predictors, draw_it)
+ggarrange(plotlist = plots, ncol = 4, nrow = 3)
+```
+
+Okay, there is correlation with several excluded predictors (for example, PSD95_N, pCFOS_N and other), which should be included back to model again. But we will not do it here.
+
+## Should we use LM or not?
+
+We have lots of multicollinear predictors in a dataset. But even we drop 3/4 of them, we have model with quite large residuals, and our best result explain about 0.66 of all variability - so, I think, LM isn't good choice.
+
+---
+
+
+# PCA 
+
+Make an ordinations
+
+```{r}
+pca <- rda(proteins_scale)
+head(summary(pca))
+```
+
+Plot factors' biplot and total biplot
+
+```{r}
+biplot(pca, scaling = "species", display = "species")
+biplot(pca)
+```
+
+Plot explained by PCA proportions (just for first 10 axes)
+
+```{r}
+pca_summary <- summary(pca)
+pca_result <- as.data.frame(pca_summary$cont)
+plot_data <- as.data.frame(t(as.matrix(pca_result[c("Proportion Explained"),])))
+plot_data$component <- rownames(plot_data)
+plot_data$component  <- factor(plot_data$component , levels = plot_data$component)
+
+ggplot(plot_data[1:10,], aes(component, `Proportion Explained`)) + 
+  geom_bar(stat = "identity") + 
+  scale_x_discrete(guide = guide_axis(angle = 90))
+```
+
+Draw plots, and 3D plot for first 3 axes
+
+```{r}
+df_scores <- data.frame(scores(pca, display = "sites", choices = c(1, 2, 3), scaling = "sites"), data %>% na.omit)
+
+p_genotype <- ggplot(df_scores, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = Genotype), alpha = 0.5)
+p_treatment <- ggplot(df_scores, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = Treatment), alpha = 0.5)
+p_behavior <- ggplot(df_scores, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = Behavior), alpha = 0.5)
+
+ggarrange(p_genotype, p_treatment, p_behavior, nrow = 2, ncol = 2)
+
+
+plot_ly(x=df_scores$PC1, y=df_scores$PC2, z=df_scores$PC3, color = df_scores$class, colors = "Dark2", type="scatter3d", mode="markers", size = 1) %>%
+  layout(title = "PCA 3d scatter plot",
+  scene = list(
+    xaxis = list(title = "PC1"),
+    yaxis = list(title = "PC2"),
+    zaxis = list(title = "PC3")
+  ))
+```
+
+
+---
+
+# Differential expression
+
+DeSEQ2 works only with integer numbers, so the minimum value from dataset is `r min(proteins %>% na.omit)`, maximum is `r max(proteins %>% na.omit)`. If we multipe it to 20 and round, minimum will be around 1. (Actually, I am not sure, that this rough transformation doesn't ruin all data...)
+
+Let's find out, where we can find significant difference in protein abundance according metadata
+
+```{r message=FALSE, warning=FALSE}
+d_data <- data.frame(t(as.matrix(data %>% na.omit %>% keep(is.numeric)))) %>% 
+  mutate(across(where(is.numeric), function(x){round(100*x)}))
+
+d_metadata <- data %>% na.omit %>% keep(is.factor)
+colnames(d_data) <- d_metadata$MouseID
+rownames(d_data) <- colnames(proteins_scale)
+
+d_data[1:10,1:10]
+d_metadata[1:10,]
+
+significant_proteins <- function(model){
+  dds <- DESeqDataSetFromMatrix(countData=d_data, 
+                              colData=d_metadata, 
+                              design=model)
+  dds <- DESeq(dds)
+  res <- data.frame(results(dds))
+  rownames(res) <- rownames(d_data)
+
+  res <- res[res$padj < 0.05,]
+  rownames(res)
+}
+
+significant_proteins(~Behavior)
+significant_proteins(~Treatment)
+significant_proteins(~Genotype)
+```
+
+
+
+
