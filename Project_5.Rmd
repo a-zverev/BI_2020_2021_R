@@ -1,0 +1,201 @@
+---
+title: "Project_5: Admit or don't admit"
+author: "Aleksei Zverev"
+date: "27/3/2021"
+output: 
+  html_document: 
+    keep_md: yes
+    number_section: yes
+    toc: yes
+    toc_float: yes
+---
+# Libraries
+
+Read data and load libraries
+
+```{r message = FALSE, warning = FALSE}
+library(tidyverse)
+library(ROCR)
+library(ggpubr)
+
+
+setwd('/home/alexey/BI/R/Project_5/')
+data <- read.csv('https://stats.idre.ucla.edu/stat/data/binary.csv')
+data %>% head()
+
+data$rank <- as.factor(data$rank)
+data$admit <- as.factor(data$admit)
+```
+
+# EDA
+
+```{r cars}
+colSums(is.na(data))
+str(data)
+
+ggplot(data, aes(y = gre, x = gpa)) +
+  geom_point(aes(color = admit, shape = rank)) +
+  theme_light()
+```
+
+Oooom, bad data :( Let's see on different angles, perhaps, we'll find better look
+
+```{r}
+rank_drawer <- function(a){
+  ggplot(data %>% filter(rank == a), aes(y = gre, x = gpa)) +
+  geom_point(aes(color = admit)) +
+  theme_light() + ggtitle(paste("rank =", a))
+}
+
+ggarrange(rank_drawer(1), rank_drawer(2),
+          rank_drawer(3), rank_drawer(4),
+          common.legend = T)
+```
+
+Rank is important, ok, but nothing above it. Perhaps, our groups are equal and we can't find any data for fitting?
+
+## ANOVA
+
+Make two-way ANOVA and try to find out, is there any difference in **gre** and **gpa** according grouping by *admit* + *rank*.
+
+```{r}
+ggplot(data = data, aes(x = rank, y = gre, colour = admit)) +
+  stat_summary(geom = 'pointrange', fun.data = mean_cl_normal, position = position_dodge(width = 0.2)) + 
+  theme_light()
+
+ggplot(data = data, aes(x = rank, y = gpa, colour = admit)) +
+  stat_summary(geom = 'pointrange', fun.data = mean_cl_normal, position = position_dodge(width = 0.2)) + 
+  theme_light()
+
+data %>% group_by(rank, admit) %>% summarise(size = n())
+```
+
+Sizes of groups' aren't equal, it isn't good, but not a strict rule. Go ahead.
+
+```{r}
+aov_gre <- aov(gre ~ rank*admit, data = data)
+summary(aov_gre)
+
+aov_gpa <- aov(gpa ~ rank*admit, data = data)
+summary(aov_gpa)
+```
+
+O no.. O no, o no, no, no - there is some sense in the data, we must construct classifier. But it will be the ugliest one(
+
+# log-LM
+
+```{r }
+fit <- glm(admit ~ gpa + gre + rank, data = data, family = binomial(link = 'logit'))
+summary(fit)
+```
+
+## Test model
+
+```{r}
+fit_diag <- data.frame(.fitted = fitted(fit, type = 'response'),
+                        .resid_p = resid(fit, type = 'pearson'))
+
+ggplot(fit_diag, aes(y = .resid_p, x = .fitted)) + 
+  geom_point() +
+  theme_bw() +
+  geom_hline(yintercept = 0) +  
+  geom_smooth(method = 'loess')
+```
+
+Bad one( Perhaps, drop one of predictors?
+
+```{r}
+drop1(fit, test = "Chi")
+fit2 <- update(fit, .~.-gre)
+
+fit2_diag <- data.frame(.fitted = fitted(fit2, type = 'response'),
+                        .resid_p = resid(fit2, type = 'pearson'))
+
+ggplot(fit2_diag, aes(y = .resid_p, x = .fitted)) + 
+  geom_point() +
+  theme_bw() +
+  geom_hline(yintercept = 0) +  
+  geom_smooth(method = 'loess')
+```
+
+AIC is bigger at 2, but head is smoother, hmmm... Second model, I choose you!
+
+```{r}
+overdisp_fun <- function(model) {
+  rdf <- df.residual(model)  # Число степеней свободы N - p
+  if (any(class(model) == 'negbin')) rdf <- rdf - 1 ## учитываем k в NegBin GLMM
+  rp <- residuals(model,type='pearson') # Пирсоновские остатки
+  Pearson.chisq <- sum(rp^2) # Сумма квадратов остатков, подчиняется Хи-квадрат распределению
+  prat <- Pearson.chisq/rdf  # Отношение суммы квадратов остатков к числу степеней свободы
+  pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE) # Уровень значимости
+  c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)        # Вывод результатов
+}
+
+overdisp_fun(fit2)
+```
+
+# Estimations
+
+Ok, how we can use our classifier, and is it good? First of all, plot ROC
+
+```{r}
+data$responce <- predict(fit2, type = 'response')
+
+
+prediction <- prediction(data$responce, data$admit)
+perf <- performance(prediction, "tpr", "fpr")
+plot(perf, colorize=T, print.cutoffs.at = seq(0, 1, by = 0.1))
+
+```
+
+Too close to diagonal - bad classifier(
+
+```{r}
+spec <- performance(prediction, x.measure = 'cutoff', measure = 'spec')
+sens <- performance(prediction, x.measure = 'cutoff', measure = 'sens')
+acc <- performance(prediction, x.measure = 'cutoff', measure = 'acc')
+
+plot(spec, col = 'red')
+plot(sens, col = 'green', add = T)
+plot(acc, col = 'blue', add = T)
+```
+
+Best cutoff is about 0.3. Where exactly?
+
+```{r}
+perf <- performance(prediction, "sens", "spec")
+df <- data.frame(cut = perf@alpha.values[[1]], sens = perf@x.values[[1]], spec = perf@y.values[[1]])
+df[which.max(df$sens + df$spec), "cut"]
+```
+
+Arrr, 0.3 it is.
+
+```{r}
+data$admit.from.lm <- ifelse(data$responce >= 0.3, 1, 0)
+
+res <- data %>% group_by(admit, admit.from.lm) %>% summarise(count = n(), .groups = "keep")
+res$group <- c("TN", "FP", "FN", "TP")
+res
+```
+
+```{r}
+recall <- as.numeric(res[4,3])/(as.numeric(res[4,3]) + as.numeric(res[3,3]))
+
+precision <- as.numeric(res[4,3])/(as.numeric(res[4,3]) + as.numeric(res[2,3]))
+```
+
+So, for our classifier, **Recall** is `r recall`, **Presicion** is `r precision`
+
+# Final plot
+
+Draw final plot - which points are predicted correctly
+
+```{r}
+data$success <- ifelse(data$admit == data$admit.from.lm, "Yes", "No")
+
+ggplot(data, aes(y = gre, x = gpa)) +
+  geom_point(aes(color = success)) +
+  theme_light()
+```
+
+More green than red! Wow! Such science!
